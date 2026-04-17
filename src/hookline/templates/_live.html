@@ -1,0 +1,33 @@
+{% from "_status.html" import pill %}
+<section class="stats" aria-label="Totals">
+  <div class="stat"><span class="stat-n">{{ counts.pending }}</span><span class="stat-l">pending</span></div>
+  <div class="stat"><span class="stat-n ok">{{ counts.delivered }}</span><span class="stat-l">delivered</span></div>
+  <div class="stat"><span class="stat-n bad">{{ counts.dead }}</span><span class="stat-l">dead-lettered</span></div>
+  <div class="stat"><span class="stat-n">{% if counts.rate >= 0 %}{{ counts.rate }}%{% else %}&ndash;{% endif %}</span><span class="stat-l">success, last 24h</span></div>
+</section>
+
+<div class="table-wrap">
+<table class="deliveries">
+  <thead>
+    <tr><th scope="col">Status</th><th scope="col">Event</th><th scope="col">Endpoint</th><th scope="col" class="num">Attempts</th><th scope="col">Next / last</th><th scope="col">Created</th></tr>
+  </thead>
+  <tbody>
+  {% for d in deliveries %}
+    <tr>
+      <td>{{ pill(d.status) }}</td>
+      <td><a class="row-link" href="/dashboard/deliveries/{{ d.id }}">{{ d.event.type }}</a><span class="id">{{ d.id|string|truncate(8, True, '') }}</span></td>
+      <td class="mono dim">{{ d.endpoint.url|host }}</td>
+      <td class="num mono">{{ d.run_attempts }}{% if d.total_attempts != d.run_attempts %}<span class="dim">/{{ d.total_attempts }}</span>{% endif %}</td>
+      <td class="dim">
+        {% if d.status == DeliveryStatus.pending %}<time datetime="{{ d.next_attempt_at.isoformat() }}" title="{{ d.next_attempt_at }}">{{ d.next_attempt_at|ago(now) }}</time>
+        {% elif d.last_error %}<span class="err" title="{{ d.last_error }}">{{ d.last_error|truncate(48) }}</span>
+        {% else %}<time datetime="{{ d.finished_at.isoformat() if d.finished_at else '' }}">{{ d.finished_at|ago(now) }}</time>{% endif %}
+      </td>
+      <td class="dim"><time datetime="{{ d.created_at.isoformat() }}" title="{{ d.created_at }}">{{ d.created_at|ago(now) }}</time></td>
+    </tr>
+  {% else %}
+    <tr><td colspan="6" class="empty">Nothing here yet. <code>POST /v1/events</code> and it shows up within a second.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>

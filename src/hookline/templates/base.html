@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>{% block title %}Hookline{% endblock %}</title>
+  <link rel="icon" href="/dashboard/static/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/dashboard/static/app.css">
+  <script src="https://unpkg.com/htmx.org@2.0.4" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="bar">
+    <a class="brand" href="/dashboard"><img src="/dashboard/static/logo.svg" alt="" width="22" height="22"> Hookline</a>
+    <nav aria-label="Sections">
+      <a href="/dashboard" {% if page == 'deliveries' %}aria-current="page"{% endif %}>Deliveries</a>
+      <a href="/dashboard/endpoints" {% if page == 'endpoints' %}aria-current="page"{% endif %}>Endpoints</a>
+      <a href="/docs">API</a>
+    </nav>
+  </header>
+  <main id="main" class="wrap">
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

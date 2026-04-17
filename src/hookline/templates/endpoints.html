@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Endpoints · Hookline{% endblock %}
+{% block content %}
+<div class="head"><h1>Endpoints</h1></div>
+<div class="table-wrap">
+<table>
+  <thead><tr><th scope="col">URL</th><th scope="col">Events</th><th scope="col">Circuit</th><th scope="col" class="num">Deliveries</th><th scope="col">Created</th></tr></thead>
+  <tbody>
+  {% for e in endpoints %}
+    <tr>
+      <td class="mono">{{ e.url }}{% if e.description %}<span class="id">{{ e.description }}</span>{% endif %}{% if not e.active %} <span class="pill pill-dead">disabled</span>{% endif %}</td>
+      <td class="mono dim">{{ e.event_types|join(', ') }}</td>
+      <td>{% if e.circuit_open_until and e.circuit_open_until > now %}<span class="pill pill-pending" title="until {{ e.circuit_open_until }}">open, {{ e.circuit_open_until|ago(now) }}</span>{% else %}<span class="pill pill-delivered">closed</span>{% endif %}</td>
+      <td class="num mono">{{ stats.get(e.id, 0) }}</td>
+      <td class="dim">{{ e.created_at|ago(now) }}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="5" class="empty">No endpoints. <code>POST /v1/endpoints</code> with a URL to add one.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endblock %}

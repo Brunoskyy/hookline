@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}Deliveries · Hookline{% endblock %}
+{% block content %}
+<div class="head">
+  <h1>Deliveries</h1>
+  <nav class="filters" aria-label="Filter by status">
+    <a href="/dashboard" {% if not status_filter %}aria-current="true"{% endif %}>All</a>
+    {% for s in DeliveryStatus %}<a href="/dashboard?status={{ s.value }}" {% if status_filter == s %}aria-current="true"{% endif %}>{{ s.value|capitalize }}</a>{% endfor %}
+  </nav>
+</div>
+<div id="live" hx-get="/dashboard/rows{% if status_filter %}?status={{ status_filter.value }}{% endif %}" hx-trigger="every 3s" hx-swap="innerHTML">
+  {% include "_live.html" %}
+</div>
+{% endblock %}

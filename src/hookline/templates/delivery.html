@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% from "_status.html" import pill %}
+{% block title %}{{ d.event.type }} · Hookline{% endblock %}
+{% block content %}
+<a class="back" href="/dashboard">&larr; Deliveries</a>
+<div class="head">
+  <div>
+    <h1>{{ d.event.type }} {{ pill(d.status) }}</h1>
+    <p class="sub mono">{{ d.id }} &rarr; {{ d.endpoint.url }}</p>
+  </div>
+  {% if d.status != DeliveryStatus.pending %}
+  <button class="btn" hx-post="/dashboard/deliveries/{{ d.id }}/replay" hx-swap="none">Replay</button>
+  {% endif %}
+</div>
+
+<div class="grid">
+  <section aria-labelledby="timeline-h">
+    <h2 id="timeline-h">Attempts</h2>
+    <ol class="timeline">
+      {% for a in d.attempts %}
+      <li class="{{ 'ok' if a.ok else 'fail' }}">
+        <div class="t-head">
+          <span class="t-n">#{{ a.number }}</span>
+          <span class="t-code">{% if a.status_code %}{{ a.status_code }}{% else %}no response{% endif %}</span>
+          <span class="dim mono">{{ a.duration_ms }} ms</span>
+          <time class="dim" datetime="{{ a.started_at.isoformat() }}" title="{{ a.started_at }}">{{ a.started_at|ago(now) }}</time>
+        </div>
+        {% if a.error %}<p class="err">{{ a.error }}</p>{% endif %}
+        {% if a.response_body %}<pre class="resp">{{ a.response_body }}</pre>{% endif %}
+        {% if a.next_attempt_at %}<p class="gap">retry scheduled <time datetime="{{ a.next_attempt_at.isoformat() }}" title="{{ a.next_attempt_at }}">{{ a.next_attempt_at|ago(now) }}</time></p>{% endif %}
+      </li>
+      {% endfor %}
+      {% if d.status == DeliveryStatus.pending %}
+      <li class="waiting"><div class="t-head"><span class="t-n">#{{ d.total_attempts + 1 }}</span><span class="dim">due <time datetime="{{ d.next_attempt_at.isoformat() }}">{{ d.next_attempt_at|ago(now) }}</time></span></div></li>
+      {% elif d.status == DeliveryStatus.dead %}
+      <li class="dead"><div class="t-head"><span class="t-n">DLQ</span><span>gave up: {{ d.last_error }}</span></div></li>
+      {% endif %}
+    </ol>
+  </section>
+  <aside aria-labelledby="payload-h">
+    <h2 id="payload-h">Payload</h2>
+    <pre class="payload">{{ body }}</pre>
+    <dl class="facts">
+      <dt>Event</dt><dd class="mono">{{ d.event.id }}</dd>
+      <dt>Created</dt><dd>{{ d.created_at.strftime('%Y-%m-%d %H:%M:%S') }} UTC</dd>
+      {% if d.finished_at %}<dt>Finished</dt><dd>{{ d.finished_at.strftime('%Y-%m-%d %H:%M:%S') }} UTC</dd>{% endif %}
+      <dt>Attempts</dt><dd>{{ d.run_attempts }} this run, {{ d.total_attempts }} total</dd>
+    </dl>
+  </aside>
+</div>
+{% endblock %}
