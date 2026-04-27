@@ -59,3 +59,35 @@ async def test_drops_foreign_messages(sqs: tuple[Any, str]) -> None:
 async def test_ack_without_receipt_is_a_noop(sqs: tuple[Any, str]) -> None:
     client, url = sqs
     await SQSQueue(client, url, wait_seconds=0).ack(Claim(delivery_id=uuid.uuid4()))
+
+
+async def test_lambda_worker_runs_each_record_and_reports_failures(
+    runtime: Any, receiver: Any, sqs: tuple[Any, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sqlalchemy import select
+
+    from hookline import aws, service
+    from hookline.models import Delivery, DeliveryStatus, Endpoint
+
+    client, url = sqs
+    runtime.queue = SQSQueue(client, url, wait_seconds=0)
+    monkeypatch.setattr(aws, "_runtime", runtime)
+    async with runtime.sessionmaker() as session:
+        session.add(Endpoint(url="http://127.0.0.1:9000/", secret="whsec_l"))
+        await session.commit()
+        await service.publish(
+            session, runtime.queue, event_type="t", payload={}, idempotency_key=None
+        )
+        [delivery] = await session.scalars(select(Delivery))
+    records = [
+        {"messageId": "m1", "body": str(delivery.id)},
+        {"messageId": "m2", "body": "garbage"},
+    ]
+    result = await aws._handle(records)
+    assert result == {"batchItemFailures": [{"itemIdentifier": "m2"}]}
+    async with runtime.sessionmaker() as session:
+        done = await session.get(Delivery, delivery.id)
+    assert done is not None
+    assert done.status is DeliveryStatus.delivered
+    # A duplicate message for a finished delivery is a no-op, not an error.
+    assert await aws._handle(records[:1]) == {"batchItemFailures": []}
