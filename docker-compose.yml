@@ -1,0 +1,43 @@
+# Everything for a local demo: Postgres, the API with the dashboard, a worker, and a receiver
+# that fails twice per event before accepting.
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: hookline
+      POSTGRES_PASSWORD: hookline
+      POSTGRES_DB: hookline
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hookline"]
+      interval: 2s
+      retries: 20
+
+  migrate:
+    build: .
+    command: ["alembic", "upgrade", "head"]
+    environment: &env
+      HOOKLINE_DATABASE_URL: postgresql+asyncpg://hookline:hookline@db:5432/hookline
+      HOOKLINE_API_KEY: dev-key
+      HOOKLINE_ALLOW_PRIVATE_URLS: "true"
+      HOOKLINE_BACKOFF_BASE_SECONDS: "5"
+    depends_on:
+      db: { condition: service_healthy }
+
+  api:
+    build: .
+    environment: *env
+    ports: ["8000:8000"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+  worker:
+    build: .
+    command: ["hookline", "worker"]
+    environment: *env
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+  receiver:
+    build: .
+    command: ["hookline", "receiver", "--host", "0.0.0.0", "--fail", "2"]
+    ports: ["9000:9000"]

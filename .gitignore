@@ -10,3 +10,4 @@ dist/
 infra/.terraform/
 infra/*.tfstate*
 infra/.terraform.lock.hcl
+build/
