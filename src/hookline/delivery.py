@@ -18,7 +18,7 @@ from hookline.models import Attempt, Delivery, DeliveryStatus, Endpoint, Event
 from hookline.queues import Claim, Queue, take_lease
 from hookline.retry import backoff, parse_retry_after
 from hookline.signing import HEADER, sign
-from hookline.urls import UnsafeURLError, check_url
+from hookline.urls import ResolutionError, UnsafeURLError, check_url
 
 log = logging.getLogger("hookline.delivery")
 
@@ -136,6 +136,8 @@ class Deliverer:
 
         try:
             await check_url(url, allow_private=self.settings.allow_private_urls)
+        except ResolutionError as e:
+            return done(error=str(e))
         except UnsafeURLError as e:
             return done(error=f"blocked: {e}", permanent=True)
 

@@ -17,6 +17,11 @@ class UnsafeURLError(ValueError):
     pass
 
 
+class ResolutionError(UnsafeURLError):
+    """The name did not resolve. Unlike a blocked address this may fix itself, so a delivery
+    that hits it is retried rather than given up on."""
+
+
 def _is_public(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
         return _is_public(ip.ipv4_mapped)
@@ -47,7 +52,7 @@ async def resolve(host: str, port: int) -> list[ipaddress.IPv4Address | ipaddres
     try:
         infos = await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except socket.gaierror as e:
-        raise UnsafeURLError(f"cannot resolve {host}") from e
+        raise ResolutionError(f"cannot resolve {host}") from e
     return [ipaddress.ip_address(info[4][0]) for info in infos]
 
 

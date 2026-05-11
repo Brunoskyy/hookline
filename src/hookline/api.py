@@ -117,7 +117,8 @@ def create_app(settings: Settings | None = None, runtime: Runtime | None = None)
         if not cfg.api_key:
             return
         expected = f"Bearer {cfg.api_key}"
-        if authorization is None or not hmac.compare_digest(authorization, expected):
+        given = (authorization or "").encode()
+        if not hmac.compare_digest(given, expected.encode()):
             raise HTTPException(
                 status.HTTP_401_UNAUTHORIZED,
                 "missing or wrong API key",

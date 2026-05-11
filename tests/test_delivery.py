@@ -233,3 +233,15 @@ async def test_disabled_endpoint_dead_letters_pending(
     final = await reload(runtime, d)
     assert final.status is DeliveryStatus.dead and final.last_error == "endpoint is disabled"
     assert receiver.requests == []
+
+
+async def test_dns_failure_is_retried_not_dead_lettered(
+    runtime: Runtime, receiver: FakeReceiver
+) -> None:
+    [d] = await setup_one(runtime, "https://does-not-exist.invalid/hook")
+    runtime.settings.allow_private_urls = False
+    await drain(runtime)
+    after = await reload(runtime, d)
+    assert after.status is DeliveryStatus.pending
+    assert (after.last_error or "").startswith("cannot resolve")
+    assert receiver.requests == []

@@ -160,3 +160,21 @@ async def test_dashboard_renders_and_guards_replay(
     assert ok.status_code == 200
     assert (await api.get("/dashboard/endpoints", auth=auth)).status_code == 200
     assert (await api.get("/dashboard/rows", auth=auth)).status_code == 200
+
+
+async def test_non_ascii_credentials_are_just_wrong(api: httpx.AsyncClient) -> None:
+    r = await api.get("/v1/endpoints", headers=[(b"Authorization", "Bearer chave-ç".encode())])
+    assert r.status_code == 401
+    basic = httpx.BasicAuth("admin", "senha-ç")
+    assert (await api.get("/dashboard", auth=basic)).status_code == 401
+
+
+def test_span_formatting() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from hookline.dashboard import span
+
+    t = datetime(2026, 1, 1, tzinfo=UTC)
+    assert span(t, t + timedelta(seconds=6)) == "6s"
+    assert span(t, t + timedelta(seconds=150)) == "2m 30s"
+    assert span(t, t + timedelta(hours=3)) == "3h"

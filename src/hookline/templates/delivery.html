@@ -27,7 +27,7 @@
         </div>
         {% if a.error %}<p class="err">{{ a.error }}</p>{% endif %}
         {% if a.response_body %}<pre class="resp">{{ a.response_body }}</pre>{% endif %}
-        {% if a.next_attempt_at %}<p class="gap">retry scheduled <time datetime="{{ a.next_attempt_at.isoformat() }}" title="{{ a.next_attempt_at }}">{{ a.next_attempt_at|ago(now) }}</time></p>{% endif %}
+        {% if a.next_attempt_at %}<p class="gap">next try after <time datetime="{{ a.next_attempt_at.isoformat() }}" title="{{ a.next_attempt_at }}">{{ a.started_at|span(a.next_attempt_at) }}</time>{% if a.next_attempt_at > now %}, {{ a.next_attempt_at|ago(now) }}{% endif %}</p>{% endif %}
       </li>
       {% endfor %}
       {% if d.status == DeliveryStatus.pending %}

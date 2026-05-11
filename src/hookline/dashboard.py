@@ -2,6 +2,7 @@
 
 import base64
 import hmac
+import json
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -39,6 +40,16 @@ def ago(value: datetime | None, now: datetime | None = None) -> str:
     return f"in {text}" if future else f"{text} ago"
 
 
+def span(start: datetime, end: datetime) -> str:
+    """'6s', '2m 30s': the gap between an attempt and the retry it scheduled."""
+    s = max(0, int((end - start).total_seconds()))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m" + (f" {s % 60}s" if s % 60 else "")
+    return f"{s // 3600}h" + (f" {s % 3600 // 60}m" if s % 3600 // 60 else "")
+
+
 def host(url: str) -> str:
     parts = urlsplit(url)
     return (parts.netloc or url) + (parts.path if parts.path not in ("", "/") else "")
@@ -48,6 +59,7 @@ def mount_dashboard(app: FastAPI, settings: Settings, templates_dir: Path) -> No
     templates = Jinja2Templates(directory=templates_dir)
     templates.env.filters["ago"] = ago
     templates.env.filters["host"] = host
+    templates.env.filters["span"] = span
     templates.env.globals["DeliveryStatus"] = DeliveryStatus
     app.mount(
         "/dashboard/static",
@@ -65,7 +77,7 @@ def mount_dashboard(app: FastAPI, settings: Settings, templates_dir: Path) -> No
             except ValueError:
                 decoded = ""
             _, _, password = decoded.partition(":")
-            ok = hmac.compare_digest(password, settings.api_key)
+            ok = hmac.compare_digest(password.encode(), settings.api_key.encode())
         if not ok:
             raise HTTPException(
                 status.HTTP_401_UNAUTHORIZED,
@@ -155,7 +167,7 @@ def mount_dashboard(app: FastAPI, settings: Settings, templates_dir: Path) -> No
             "delivery.html",
             {
                 "d": delivery,
-                "body": envelope(delivery.event).decode(),
+                "body": json.dumps(json.loads(envelope(delivery.event)), indent=2),
                 "now": datetime.now(UTC),
                 "page": "deliveries",
             },
