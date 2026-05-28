@@ -13,7 +13,7 @@ from mangum import Mangum
 
 from hookline.api import create_app
 from hookline.config import get_settings
-from hookline.queues import Claim, SQSQueue
+from hookline.queues import Claim, SQSQueue, reconcile
 from hookline.runtime import build_runtime
 
 api_handler = Mangum(create_app(), lifespan="auto")
@@ -40,7 +40,8 @@ async def _handle(records: list[dict[str, Any]]) -> dict[str, list[dict[str, str
     async def one(record: dict[str, Any]) -> None:
         try:
             claim = Claim(delivery_id=uuid.UUID(record["body"]))
-            # Lambda deletes successful messages itself; skip the queue's own ack.
+            # Lambda deletes a message only when it is not reported as failed, and it is
+            # reported as failed whenever the outcome did not make it into the database.
             await deliverer.run_once(claim)
         except Exception:
             failures.append({"itemIdentifier": record["messageId"]})
@@ -53,3 +54,21 @@ async def _handle(records: list[dict[str, Any]]) -> dict[str, list[dict[str, str
 
 def sqs_handler(event: dict[str, Any], context: object) -> dict[str, list[dict[str, str]]]:
     return _loop.run_until_complete(_handle(event.get("Records", [])))
+
+
+async def _reconcile() -> dict[str, int]:
+    runtime = _get_runtime()
+    s = runtime.settings
+    requeued = await reconcile(
+        runtime.sessionmaker,
+        runtime.queue,
+        grace_seconds=s.reconcile_grace_seconds,
+        limit=s.reconcile_batch_size,
+    )
+    return {"requeued": requeued}
+
+
+def reconcile_handler(event: dict[str, Any], context: object) -> dict[str, int]:
+    """Runs on an EventBridge schedule: re-queues deliveries whose message was lost, including
+    the ones whose message ended in the poison queue."""
+    return _loop.run_until_complete(_reconcile())

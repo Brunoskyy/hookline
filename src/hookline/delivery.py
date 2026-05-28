@@ -1,7 +1,9 @@
 """One attempt at one delivery, and everything decided from its outcome."""
 
+import asyncio
 import json
 import logging
+import random
 import time
 import uuid
 from dataclasses import dataclass
@@ -18,11 +20,16 @@ from hookline.models import Attempt, Delivery, DeliveryStatus, Endpoint, Event
 from hookline.queues import Claim, Queue, take_lease
 from hookline.retry import backoff, parse_retry_after
 from hookline.signing import HEADER, sign
-from hookline.urls import ResolutionError, UnsafeURLError, check_url
+from hookline.urls import ResolutionError, UnsafeURLError, check_url, pinned
 
 log = logging.getLogger("hookline.delivery")
 
 USER_AGENT = "Hookline/0.1 (+https://github.com/Brunoskyy/hookline)"
+
+
+def _aware(value: datetime) -> datetime:
+    """SQLite hands timestamps back without a zone; they are stored in UTC."""
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
 def envelope(event: Event) -> bytes:
@@ -69,11 +76,15 @@ class Deliverer:
         self.client = client
 
     async def process(self, claim: Claim) -> None:
-        """Runs one attempt for a claimed delivery. Never raises for delivery failures."""
-        try:
-            await self.run_once(claim)
-        finally:
-            await self.queue.ack(claim)
+        """Runs one attempt for a claimed delivery, then acknowledges the claim.
+
+        The acknowledgement comes only after the outcome is committed. If anything in between
+        raises (the database went away while recording), the message stays in the queue and
+        comes back after its visibility timeout, instead of being deleted with nothing left to
+        say the delivery still needs doing.
+        """
+        await self.run_once(claim)
+        await self.queue.ack(claim)
 
     async def run_once(self, claim: Claim) -> None:
         """One attempt without acknowledging the claim; for callers that ack themselves."""
@@ -101,13 +112,16 @@ class Deliverer:
                 await self._finish_without_attempt(session, delivery, "endpoint is disabled")
                 return
             if endpoint.circuit_open_until and endpoint.circuit_open_until > now:
-                # The endpoint is resting. Wait for it without spending an attempt.
-                delivery.next_attempt_at = endpoint.circuit_open_until
+                # The endpoint is resting. Wait for it without spending an attempt, and spread
+                # the waiting deliveries over a window after it reopens so they do not all
+                # arrive in the same second; the first to land is the probe.
+                spread = timedelta(seconds=random.uniform(0, self.settings.circuit_open_seconds))  # noqa: S311
+                delivery.next_attempt_at = endpoint.circuit_open_until + spread
                 delivery.locked_until = None
                 delivery.lease_token = None
                 await session.commit()
                 await self.queue.schedule(
-                    delivery.id, (endpoint.circuit_open_until - now).total_seconds()
+                    delivery.id, (delivery.next_attempt_at - now).total_seconds()
                 )
                 return
             url, secret = endpoint.url, endpoint.secret
@@ -135,39 +149,50 @@ class Deliverer:
             return Outcome(started_at=started, duration_ms=ms, **kwargs)  # type: ignore[arg-type]
 
         try:
-            await check_url(url, allow_private=self.settings.allow_private_urls)
+            host, addresses = await check_url(url, allow_private=self.settings.allow_private_urls)
         except ResolutionError as e:
             return done(error=str(e))
         except UnsafeURLError as e:
             return done(error=f"blocked: {e}", permanent=True)
 
         limit = self.settings.max_response_bytes
+        deadline = self.settings.attempt_deadline_seconds
         try:
-            async with self.client.stream(
-                "POST",
-                url,
-                content=body,
-                headers=headers,
-                timeout=self.settings.request_timeout_seconds,
-                follow_redirects=False,
-            ) as response:
-                chunks: list[bytes] = []
-                size = 0
-                async for chunk in response.aiter_bytes():
-                    chunks.append(chunk)
-                    size += len(chunk)
-                    if size >= limit:
-                        break
-                text = b"".join(chunks)[:limit].decode("utf-8", errors="replace")
-                error = None
-                if 300 <= response.status_code < 400:
-                    error = "redirects are not followed; point the endpoint at the final URL"
-                return done(
-                    status_code=response.status_code,
-                    response_body=text or None,
-                    retry_after=response.headers.get("retry-after"),
-                    error=error,
-                )
+            # The httpx timeout is per read; a receiver sending a byte every few seconds would
+            # never trip it. The deadline bounds the whole attempt, well inside the lease.
+            async with asyncio.timeout(deadline):
+                # Connect to the address that was checked, not to whatever the name resolves
+                # to a moment later.
+                with pinned(host, addresses):
+                    async with self.client.stream(
+                        "POST",
+                        url,
+                        content=body,
+                        headers=headers,
+                        timeout=self.settings.request_timeout_seconds,
+                        follow_redirects=False,
+                    ) as response:
+                        chunks: list[bytes] = []
+                        size = 0
+                        async for chunk in response.aiter_bytes():
+                            chunks.append(chunk)
+                            size += len(chunk)
+                            if size >= limit:
+                                break
+                        text = b"".join(chunks)[:limit].decode("utf-8", errors="replace")
+                        error = None
+                        if 300 <= response.status_code < 400:
+                            error = (
+                                "redirects are not followed; point the endpoint at the final URL"
+                            )
+                        return done(
+                            status_code=response.status_code,
+                            response_body=text or None,
+                            retry_after=response.headers.get("retry-after"),
+                            error=error,
+                        )
+        except TimeoutError:
+            return done(error=f"no complete response within {deadline:g}s")
         except httpx.TimeoutException:
             return done(error=f"timed out after {self.settings.request_timeout_seconds:g}s")
         except httpx.HTTPError as e:
@@ -251,36 +276,44 @@ class Deliverer:
     ) -> datetime | None:
         """Counts a failure against the endpoint and opens its circuit at the threshold.
 
-        The counter is incremented in SQL so concurrent failures to one endpoint all count.
-        Opening the circuit leaves the counter one short of the threshold, so the first probe
-        after it closes reopens it straight away if the endpoint is still down; each reopening
-        doubles the rest, up to the cap.
+        The counter is incremented in SQL so concurrent failures to one endpoint all count,
+        and the row lock that UPDATE takes serializes them. A circuit is opened only if it is
+        not open already: failures that were in flight when it tripped land on an open
+        circuit and add nothing, so one outage is one trip, not one per request that was out
+        at the time. Opening leaves the counter one short of the threshold, so the first probe
+        after it closes reopens it if the endpoint is still down; each reopening doubles the
+        rest, up to the cap.
         """
         s = self.settings
-        row = (
+        failures, trips, open_until = (
             await session.execute(
                 update(Endpoint)
                 .where(Endpoint.id == endpoint_id)
                 .values(consecutive_failures=Endpoint.consecutive_failures + 1)
-                .returning(Endpoint.consecutive_failures, Endpoint.circuit_trips)
+                .returning(
+                    Endpoint.consecutive_failures,
+                    Endpoint.circuit_trips,
+                    Endpoint.circuit_open_until,
+                )
             )
         ).one()
-        failures, trips = row
+        if open_until is not None and _aware(open_until) > now:
+            return _aware(open_until)
         if failures < s.circuit_failure_threshold:
             return None
         trips += 1
         rest = min(s.circuit_open_cap_seconds, s.circuit_open_seconds * 2 ** (trips - 1))
-        open_until = now + timedelta(seconds=rest)
+        until = now + timedelta(seconds=rest)
         await session.execute(
             update(Endpoint)
             .where(Endpoint.id == endpoint_id)
             .values(
                 consecutive_failures=s.circuit_failure_threshold - 1,
                 circuit_trips=trips,
-                circuit_open_until=open_until,
+                circuit_open_until=until,
             )
         )
-        return open_until
+        return until
 
     async def _finish_without_attempt(
         self, session: AsyncSession, delivery: Delivery, reason: str

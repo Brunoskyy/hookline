@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 
+import httpcore
 import httpx
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -9,6 +10,7 @@ from hookline.config import Settings
 from hookline.db import make_engine, make_sessionmaker
 from hookline.delivery import Deliverer
 from hookline.queues import PostgresQueue, Queue, SQSQueue
+from hookline.urls import PinnedBackend
 
 
 @dataclass
@@ -40,10 +42,24 @@ def build_queue(settings: Settings, sessionmaker: async_sessionmaker[AsyncSessio
     return PostgresQueue(sessionmaker, settings.lease_seconds)
 
 
-def build_runtime(settings: Settings) -> Runtime:
-    engine = make_engine(settings.database_url)
-    sessionmaker = make_sessionmaker(engine)
-    client = httpx.AsyncClient(
+def make_client(network_backend: httpcore.AsyncNetworkBackend | None = None) -> httpx.AsyncClient:
+    """The client deliveries go out on. Its connections are opened to the address the URL
+    check approved, see :class:`hookline.urls.PinnedBackend`."""
+    transport = httpx.AsyncHTTPTransport(
         limits=httpx.Limits(max_connections=100, max_keepalive_connections=20)
     )
+    # httpx does not take a network backend; its httpcore pool does.
+    transport._pool._network_backend = PinnedBackend(network_backend)
+    return httpx.AsyncClient(transport=transport)
+
+
+def build_runtime(settings: Settings) -> Runtime:
+    engine = make_engine(
+        settings.database_url,
+        pool_size=settings.db_pool_size,
+        max_overflow=settings.db_max_overflow,
+        null_pool=settings.db_null_pool,
+    )
+    sessionmaker = make_sessionmaker(engine)
+    client = make_client()
     return Runtime(settings, engine, sessionmaker, build_queue(settings, sessionmaker), client)

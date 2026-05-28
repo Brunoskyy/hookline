@@ -47,6 +47,8 @@ async def publish(
     the loser rolls back and reads the winner's event.
     """
     digest = request_hash(event_type, payload)
+    # An empty key would be stored but never looked up; treat it as no key at all.
+    idempotency_key = idempotency_key or None
     if idempotency_key:
         existing = await _by_key(session, idempotency_key)
         if existing is not None:
@@ -76,6 +78,9 @@ async def publish(
     ]
     session.add_all(deliveries)
     await session.commit()
+    # The rows are committed before the queue hears about them. If a send fails here (SQS
+    # throttling, a network error) the delivery is not lost: the reconciler finds pending
+    # rows that are due and nobody holds, and queues them again.
     for d in deliveries:
         await queue.schedule(d.id, 0)
     return event, True

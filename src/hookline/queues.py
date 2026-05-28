@@ -101,6 +101,42 @@ class PostgresQueue:
         return None
 
 
+async def reconcile(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    queue: Queue,
+    *,
+    grace_seconds: float,
+    limit: int,
+) -> int:
+    """Queues again the deliveries a message-based queue has lost track of.
+
+    The database is the source of truth and the queue only says when to look. A delivery can
+    be committed and then miss its message: the send failed after the commit, a worker died
+    after deleting the message, or the message ended in the poison queue. Such a row stays
+    ``pending``, due and unleased for good. This finds rows overdue by more than
+    ``grace_seconds`` (fresh ones still have their message on the way) and sends each a new
+    one. Sending one too many is harmless: the worker only acts on a row it can lease.
+
+    The Postgres queue polls the table itself, so there is nothing to reconcile there.
+    """
+    if isinstance(queue, PostgresQueue):
+        return 0
+    async with sessionmaker() as session:
+        now = await db_now(session)
+        cutoff = now - timedelta(seconds=grace_seconds)
+        ids = list(
+            await session.scalars(
+                select(Delivery.id)
+                .where(*due_filter(now), Delivery.next_attempt_at <= cutoff)  # type: ignore[arg-type]
+                .order_by(Delivery.next_attempt_at)
+                .limit(limit)
+            )
+        )
+    for delivery_id in ids:
+        await queue.schedule(delivery_id, 0)
+    return len(ids)
+
+
 class SQSQueue:
     def __init__(self, client: "SQSClient", queue_url: str, *, wait_seconds: int = 10):
         self.client = client

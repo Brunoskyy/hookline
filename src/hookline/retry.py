@@ -26,16 +26,23 @@ def backoff(
 
 
 def parse_retry_after(value: str | None, *, now_epoch: float, cap: float) -> float | None:
-    """Seconds requested by a ``Retry-After`` header, capped. None when absent or unreadable."""
+    """Seconds requested by a ``Retry-After`` header, capped. None when absent or unreadable.
+
+    The header is the receiver's to write, so anything it sends is untrusted: only ASCII
+    digits count as delta-seconds (``str.isdigit`` also accepts ``'²'``, which ``float``
+    rejects), and nothing here raises.
+    """
     if not value:
         return None
     value = value.strip()
-    if value.isdigit():
-        seconds = float(value)
-    else:
-        try:
+    try:
+        if value.isascii() and value.isdigit():
+            seconds = float(value)
+        else:
             when = parsedate_to_datetime(value)
-        except (TypeError, ValueError):
-            return None
-        seconds = when.timestamp() - now_epoch
+            seconds = when.timestamp() - now_epoch
+    except (TypeError, ValueError, OverflowError, IndexError):
+        return None
+    if seconds != seconds:  # NaN
+        return None
     return max(0.0, min(cap, seconds))

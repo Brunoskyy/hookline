@@ -44,3 +44,27 @@ variable "max_attempts" {
   type    = number
   default = 8
 }
+
+variable "worker_max_concurrency" {
+  description = "Most worker Lambda containers SQS may run at once."
+  type        = number
+  default     = 20
+}
+
+variable "api_reserved_concurrency" {
+  description = "Most API Lambda containers at once."
+  type        = number
+  default     = 10
+}
+
+variable "db_pool_per_container" {
+  description = "Database connections each Lambda container may hold."
+  type        = number
+  default     = 2
+}
+
+variable "db_max_connections" {
+  description = "max_connections of the database instance; about 80 on db.t4g.micro."
+  type        = number
+  default     = 80
+}

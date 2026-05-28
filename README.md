@@ -90,20 +90,33 @@ POST /v1/events ──> event + one delivery per subscribed endpoint
   without two of them getting the same row. If a worker dies mid-request its lease runs out and
   someone else picks the delivery up, so delivery is at-least-once, never stuck. Receivers
   dedupe on `Hookline-Event-Id`.
+- **Every attempt has a deadline.** httpx's timeout is per read, so a receiver that sends a
+  byte every few seconds would never trip it. The whole attempt is bounded by
+  `attempt_deadline_seconds` (20 s), and the settings refuse a deadline longer than half the
+  lease or half the Lambda timeout. A worker claims more work as soon as a slot frees up, so a
+  slow endpoint holds one slot, never the whole worker.
 - **Backoff is exponential with jitter**: 30 s, 1 min, 2 min... capped at six hours, with half
   of each delay random so a batch that failed together does not come back together. A
   `Retry-After` header wins when there is one. Eight attempts by default, then the delivery is
   dead-lettered with its last error, and a replay starts a fresh run.
 - **A circuit breaker per endpoint.** After five consecutive failures, across all its
-  deliveries, the endpoint rests for a minute. Deliveries that come due meanwhile are postponed
-  without spending an attempt. The first try after the rest is a probe: if it fails the rest
-  doubles, if it succeeds everything resets.
+  deliveries, the endpoint rests for a minute. Failures still in flight when it trips land on an
+  open circuit and do not trip it again, so one outage is one trip. Deliveries that come due
+  meanwhile are postponed without spending an attempt, spread over the minute after it
+  reopens instead of arriving together. If the first of them fails the rest doubles, if it
+  succeeds everything resets.
 - **The database's clock decides.** Due times, leases and circuits all compare against
   `now()` in Postgres, not the worker's clock, so workers on skewed hosts still agree.
 - **No redirects, no private addresses.** Endpoint URLs that resolve to loopback, private,
   link-local (the cloud metadata service) or other non-public space are refused, when the
-  endpoint is registered and again before every attempt. Redirects are not followed, since a
-  public URL could redirect somewhere private.
+  endpoint is registered and again before every attempt, including IPv6 forms that wrap an
+  IPv4 address (mapped, compatible, NAT64, 6to4, Teredo). The connection then goes to the
+  address that passed the check, not to a second DNS answer, so rebinding a name between the
+  check and the connect does not work; Host and TLS still use the registered name. Redirects
+  are not followed, since a public URL could redirect somewhere private.
+- **Untrusted headers stay untrusted.** A receiver's `Retry-After` is only read as ASCII digits
+  or a real HTTP date, and `verify()` raises `SignatureError` and nothing else for any header,
+  however it was crafted.
 
 ## Signatures
 
@@ -121,6 +134,7 @@ Verifying on the receiving side, with the helper this package ships:
 
 ```python
 from hookline import verify, SignatureError
+
 
 @app.post("/webhooks")
 async def receive(request: Request):
@@ -144,10 +158,18 @@ compute the HMAC, and compare in constant time.
   delivery ids to SQS instead of polling Postgres. Messages only say "look at delivery X"; the
   database still decides whether it is due, so a duplicate or early message is harmless.
   Delays over SQS's 15-minute limit are sent in hops. The worker reports per-message failures,
-  and a poison-message queue catches anything that cannot be processed at all.
+  and a poison-message queue catches anything that cannot be processed at all. A message is
+  only deleted after the outcome is committed.
+- **A reconciler on a one-minute EventBridge schedule.** A delivery row can outlive its
+  message: the send failed after the commit, or the message went to the poison queue. The
+  reconciler finds pending rows that are overdue and unleased and queues them again; a
+  duplicate is harmless because the worker only acts on a row it can lease. With the Postgres
+  queue there is nothing to reconcile, and the CLI worker runs it on its own interval with SQS.
 - **RDS Postgres** in private subnets, reachable only from the functions.
-- A concurrency cap on the worker so a burst of events cannot exhaust the database's
-  connections.
+- **A connection budget.** Each Lambda container has its own pool, so the worker cap, the
+  API's reserved concurrency and a pool of two per container add up to a fixed ceiling, and
+  `tofu plan` fails if that ceiling is over the database's `max_connections`. For more
+  headroom, set `HOOKLINE_DB_NULL_POOL=true` behind RDS Proxy.
 
 ```bash
 ./infra/build.sh
@@ -173,7 +195,7 @@ claim is a single `UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED) RE
 has a test that pins the exact bytes being signed.
 
 **`src/hookline/urls.py`.** Why a webhook service is an SSRF tool unless it is careful, and
-what "careful" covers.
+what "careful" covers, down to pinning the checked address into httpcore's network backend.
 
 **`src/hookline/service.py`.** Idempotency keys: two concurrent requests with the same key race
 on a unique index, and the loser reads the winner's event. A reused key with a different body
@@ -186,15 +208,19 @@ uv run pytest
 HOOKLINE_TEST_DATABASE_URL=postgresql+asyncpg://localhost/hookline_test uv run pytest
 ```
 
-77 tests. Without a database they run on SQLite: signatures (including a pinned vector and
-rotation), the backoff schedule and `Retry-After`, the URL checks, every API route, body limits
-that hold even when `Content-Length` lies, the dashboard, and the delivery engine against a
-scripted fake receiver: retry and deliver, dead-letter after the last attempt, redirects,
-blocked addresses, the circuit opening, postponing, reopening for longer and resetting, and a
-worker that loses its lease mid-request. With Postgres, three more: eight workers claiming at
-once never get the same row, ten concurrent publishes with one idempotency key make one event,
-and concurrent failures to one endpoint are all counted. The SQS queue and the Lambda handler
-run against moto.
+106 tests, 102 without a database. On SQLite: signatures (including a pinned vector, rotation
+and crafted headers), the backoff schedule and hostile `Retry-After` values, the URL checks
+and every IPv6 wrapper of a private address, every API route, body limits that hold even when
+`Content-Length` lies, the dashboard, and the delivery engine against a scripted fake
+receiver: retry and deliver, dead-letter, redirects, blocked addresses, the circuit opening,
+postponing and resetting, a worker losing its lease mid-request, an attempt cut off at its
+deadline by a server that drips bytes, a connection that goes to the checked address when DNS
+answers something else the second time, a worker that keeps claiming while one delivery
+hangs, and a claim that is not acknowledged when recording fails. The SQS queue, the Lambda
+handlers and the reconciler (a failed send after commit, then an idempotent retry, ends
+delivered) run against moto. With Postgres, four more: eight workers claiming at once never
+get the same row, ten concurrent publishes with one key make one event, concurrent failures
+are all counted, and ten failing at once trip the circuit once.
 
 ## Layout
 
@@ -220,9 +246,6 @@ infra/           Terraform for API Gateway, Lambda, SQS, RDS
 
 - One API key for everything. A real multi-tenant service needs per-tenant keys and endpoints
   scoped to them.
-- The address check and the request resolve DNS separately, so a name that changes answer in
-  between (DNS rebinding) could still slip through. Closing that means connecting to the
-  address that was checked, which needs a custom transport.
 - Secrets are stored as given. They should be encrypted at rest, and the Terraform passes the
   database password through a variable where Secrets Manager would be better.
 - No rate limit per endpoint beyond the circuit breaker.

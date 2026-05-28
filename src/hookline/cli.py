@@ -15,6 +15,7 @@ def _serve(args: argparse.Namespace) -> None:
 
 async def _worker() -> None:
     from hookline import worker
+    from hookline.queues import reconcile
     from hookline.runtime import build_runtime
 
     settings = get_settings()
@@ -32,6 +33,13 @@ async def _worker() -> None:
             concurrency=settings.worker_concurrency,
             idle_seconds=settings.worker_idle_seconds,
             stop=stop,
+            reconcile=lambda: reconcile(
+                runtime.sessionmaker,
+                runtime.queue,
+                grace_seconds=settings.reconcile_grace_seconds,
+                limit=settings.reconcile_batch_size,
+            ),
+            reconcile_interval=settings.reconcile_interval_seconds,
         )
     finally:
         await runtime.close()

@@ -8,18 +8,24 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import NullPool, StaticPool
 
 from hookline.models import Base
 
 
-def make_engine(url: str) -> AsyncEngine:
+def make_engine(
+    url: str, *, pool_size: int = 5, max_overflow: int = 5, null_pool: bool = False
+) -> AsyncEngine:
     if url.startswith("sqlite"):
         # One shared in-memory database for tests and quick demos.
         return create_async_engine(
             url, connect_args={"check_same_thread": False}, poolclass=StaticPool
         )
-    return create_async_engine(url, pool_pre_ping=True)
+    if null_pool:
+        return create_async_engine(url, poolclass=NullPool)
+    return create_async_engine(
+        url, pool_pre_ping=True, pool_size=pool_size, max_overflow=max_overflow
+    )
 
 
 def make_sessionmaker(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:

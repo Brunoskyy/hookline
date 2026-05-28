@@ -41,10 +41,11 @@ def parse(header: str) -> tuple[int, list[str]]:
         if not sep:
             continue
         if key == "t":
-            try:
-                timestamp = int(value)
-            except ValueError as e:
-                raise SignatureError("timestamp is not an integer") from e
+            # Seconds since the epoch fit in 11 digits for millennia; anything longer is an
+            # attempt to overflow the arithmetic below, not a timestamp.
+            if not (value.isascii() and value.isdigit() and len(value) <= 12):
+                raise SignatureError("timestamp is not an integer")
+            timestamp = int(value)
         elif key == "v1":
             signatures.append(value)
     if timestamp is None:
@@ -74,7 +75,9 @@ def verify(
     current = time.time() if now is None else now
     if abs(current - timestamp) > tolerance:
         raise SignatureError("timestamp outside the tolerance window")
-    expected = _digest(secret, timestamp, body)
-    if not any(hmac.compare_digest(expected, candidate) for candidate in signatures):
+    expected = _digest(secret, timestamp, body).encode()
+    # Compared as bytes: compare_digest refuses non-ASCII str, and a crafted header must end
+    # in SignatureError like any other bad one, not in a TypeError.
+    if not any(hmac.compare_digest(expected, c.encode("utf-8", "replace")) for c in signatures):
         raise SignatureError("no signature matches")
     return timestamp

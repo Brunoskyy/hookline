@@ -185,6 +185,8 @@ def create_app(settings: Settings | None = None, runtime: Runtime | None = None)
         session: SessionDep,
         idempotency_key: Annotated[str | None, Header(max_length=200)] = None,
     ) -> EventOut:
+        if idempotency_key is not None and not idempotency_key.strip():
+            raise HTTPException(400, "Idempotency-Key is empty; omit the header or give it a value")
         try:
             event, created = await service.publish(
                 session,

@@ -151,7 +151,9 @@ async def test_circuit_opens_and_postpones_without_spending_attempts(
         fourth = (await session.scalars(select(Delivery).where(Delivery.run_attempts == 0))).one()
     # The fourth came up after the circuit opened: postponed to when it closes, not sent.
     assert len(receiver.requests) == 3
-    assert fourth.next_attempt_at == ep.circuit_open_until
+    # Released within one open period after the circuit closes, spread out rather than all at once.
+    assert ep.circuit_open_until <= fourth.next_attempt_at
+    assert fourth.next_attempt_at <= ep.circuit_open_until + timedelta(seconds=60)
 
     # Due again but the circuit is still open: postponed, no request, no attempt spent.
     await make_due(runtime)
