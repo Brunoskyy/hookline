@@ -10,7 +10,7 @@ from hookline.config import Settings
 from hookline.db import make_engine, make_sessionmaker
 from hookline.delivery import Deliverer
 from hookline.queues import PostgresQueue, Queue, SQSQueue
-from hookline.urls import PinnedBackend
+from hookline.urls import PinnedTransport
 
 
 @dataclass
@@ -44,13 +44,9 @@ def build_queue(settings: Settings, sessionmaker: async_sessionmaker[AsyncSessio
 
 def make_client(network_backend: httpcore.AsyncNetworkBackend | None = None) -> httpx.AsyncClient:
     """The client deliveries go out on. Its connections are opened to the address the URL
-    check approved, see :class:`hookline.urls.PinnedBackend`."""
-    transport = httpx.AsyncHTTPTransport(
-        limits=httpx.Limits(max_connections=100, max_keepalive_connections=20)
-    )
-    # httpx does not take a network backend; its httpcore pool does.
-    transport._pool._network_backend = PinnedBackend(network_backend)
-    return httpx.AsyncClient(transport=transport)
+    check approved, see :class:`hookline.urls.PinnedTransport`."""
+    limits = httpx.Limits(max_connections=100, max_keepalive_connections=20)
+    return httpx.AsyncClient(transport=PinnedTransport(limits, network_backend))
 
 
 def build_runtime(settings: Settings) -> Runtime:

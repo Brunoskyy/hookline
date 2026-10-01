@@ -16,12 +16,13 @@ import asyncio
 import contextvars
 import ipaddress
 import socket
-from collections.abc import Iterable, Iterator
+from collections.abc import AsyncIterable, AsyncIterator, Iterable, Iterator
 from contextlib import contextmanager
 from typing import Any
 from urllib.parse import urlsplit
 
 import httpcore
+import httpx
 
 IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
 
@@ -165,3 +166,98 @@ class PinnedBackend(httpcore.AsyncNetworkBackend):
 
     async def sleep(self, seconds: float) -> None:
         await self.inner.sleep(seconds)
+
+
+# Most specific first: the first match wins.
+_HTTPCORE_ERRORS: tuple[tuple[type[Exception], type[httpx.HTTPError]], ...] = (
+    (httpcore.ConnectTimeout, httpx.ConnectTimeout),
+    (httpcore.ReadTimeout, httpx.ReadTimeout),
+    (httpcore.WriteTimeout, httpx.WriteTimeout),
+    (httpcore.PoolTimeout, httpx.PoolTimeout),
+    (httpcore.TimeoutException, httpx.TimeoutException),
+    (httpcore.ConnectError, httpx.ConnectError),
+    (httpcore.ReadError, httpx.ReadError),
+    (httpcore.WriteError, httpx.WriteError),
+    (httpcore.NetworkError, httpx.NetworkError),
+    (httpcore.ProxyError, httpx.ProxyError),
+    (httpcore.UnsupportedProtocol, httpx.UnsupportedProtocol),
+    (httpcore.LocalProtocolError, httpx.LocalProtocolError),
+    (httpcore.RemoteProtocolError, httpx.RemoteProtocolError),
+    (httpcore.ProtocolError, httpx.ProtocolError),
+)
+
+
+@contextmanager
+def _httpx_errors() -> Iterator[None]:
+    """Raise httpcore's errors as the httpx ones callers catch."""
+    try:
+        yield
+    except Exception as e:
+        for source, target in _HTTPCORE_ERRORS:
+            if isinstance(e, source):
+                raise target(str(e)) from e
+        raise
+
+
+class _ResponseStream(httpx.AsyncByteStream):
+    def __init__(self, stream: Any) -> None:
+        self._stream = stream
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        with _httpx_errors():
+            async for part in self._stream:
+                yield part
+
+    async def aclose(self) -> None:
+        if hasattr(self._stream, "aclose"):
+            await self._stream.aclose()
+
+
+class PinnedTransport(httpx.AsyncBaseTransport):
+    """An httpx transport over an httpcore pool that connects through :class:`PinnedBackend`.
+
+    httpx's own transport builds its pool without a way to pass a network backend, so this one
+    builds the pool itself, through public httpx and httpcore API only, and hands requests
+    and responses across the way httpx's transport does.
+    """
+
+    def __init__(
+        self,
+        limits: httpx.Limits,
+        network_backend: httpcore.AsyncNetworkBackend | None = None,
+    ) -> None:
+        self.backend = PinnedBackend(network_backend)
+        self.pool = httpcore.AsyncConnectionPool(
+            ssl_context=httpx.create_ssl_context(),
+            max_connections=limits.max_connections,
+            max_keepalive_connections=limits.max_keepalive_connections,
+            keepalive_expiry=limits.keepalive_expiry,
+            network_backend=self.backend,
+        )
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        assert isinstance(request.stream, httpx.AsyncByteStream)  # an async client sends these
+        req = httpcore.Request(
+            method=request.method,
+            url=httpcore.URL(
+                scheme=request.url.raw_scheme,
+                host=request.url.raw_host,
+                port=request.url.port,
+                target=request.url.raw_path,
+            ),
+            headers=request.headers.raw,
+            content=request.stream,
+            extensions=request.extensions,
+        )
+        with _httpx_errors():
+            resp = await self.pool.handle_async_request(req)
+        assert isinstance(resp.stream, AsyncIterable)  # an async pool streams async bodies
+        return httpx.Response(
+            status_code=resp.status,
+            headers=resp.headers,
+            stream=_ResponseStream(resp.stream),
+            extensions=resp.extensions,
+        )
+
+    async def aclose(self) -> None:
+        await self.pool.aclose()

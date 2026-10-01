@@ -404,6 +404,47 @@ async def test_pinning_is_scoped_to_the_request() -> None:
     assert backend.hosts == ["93.184.216.34", "example.test"]
 
 
+class FailingBackend(RecordingBackend):
+    def __init__(self, error: Exception) -> None:
+        super().__init__()
+        self.error = error
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,  # noqa: ASYNC109
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        raise self.error
+
+
+@pytest.mark.parametrize(
+    ("raised", "expected"),
+    [
+        (httpcore.ConnectTimeout("slow"), httpx.ConnectTimeout),
+        (httpcore.ConnectError("refused"), httpx.ConnectError),
+        (httpcore.ReadError("reset"), httpx.ReadError),
+    ],
+)
+async def test_the_pinned_transport_raises_what_httpx_would(
+    raised: Exception, expected: type[httpx.HTTPError]
+) -> None:
+    # Delivery tells timeouts from other failures by httpx's exception types.
+    client = make_client(FailingBackend(raised))
+    with pytest.raises(expected):
+        await client.get("http://example.test/")
+    await client.aclose()
+
+
+def test_every_httpcore_error_maps_to_its_closest_httpx_error() -> None:
+    # The first match wins, so no entry may be shadowed by a base class listed before it.
+    table = urls._HTTPCORE_ERRORS
+    for i, (source, _) in enumerate(table):
+        assert not any(issubclass(source, earlier) for earlier, _ in table[:i]), source
+
+
 # --------------------------------------------------------------------------- 6. pools
 
 
