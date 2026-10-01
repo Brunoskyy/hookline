@@ -11,14 +11,11 @@
 
 <br>
 
-Sending a webhook is one HTTP request. Sending it reliably is everything around that request:
-signing it so the receiver knows it came from you, trying again when the other side is down,
-not trying forever, not hammering an endpoint that is clearly broken, and being able to answer
-"did customer X get event Y, and what did their server say?" a week later.
-
-Hookline is that part. You post an event; it fans out to every endpoint subscribed to that
-type, signs each request, retries with backoff, parks what never succeeds in a dead-letter
-state you can replay, and keeps every attempt with its status code, timing and response.
+The name is webhooks put on a line: each one waits its turn, goes out signed, and comes back
+for another try until it lands or runs out of attempts. You post an event; Hookline fans it out
+to every subscribed endpoint, retries with backoff, parks what never succeeds in a dead-letter
+state you can replay, and keeps every attempt with its status code, timing and response, so
+"did customer X get event Y?" has an answer a week later.
 
 <p align="center">
   <img src="docs/screenshots/deliveries-light.jpg" width="49%" alt="Delivery list with pending, delivered and dead-lettered rows">
@@ -27,47 +24,60 @@ state you can replay, and keeps every attempt with its status code, timing and r
 
 ## Running it
 
-Python 3.13 and [uv](https://docs.astral.sh/uv/). Postgres for the real thing; SQLite works for
-a quick look.
+You need Python 3.13 and [uv](https://docs.astral.sh/uv/), or only Docker.
 
 ```bash
-uv sync
-cp .env.example .env                 # point HOOKLINE_DATABASE_URL at your Postgres
-uv run alembic upgrade head
-uv run hookline serve                # API + dashboard on http://127.0.0.1:8000
-uv run hookline worker               # in another terminal
+git clone https://github.com/Brunoskyy/hookline.git && cd hookline
 ```
 
-Or everything at once, including a receiver that fails twice per event before accepting:
+**With Docker**, from the repo root, one command starts Postgres, the migrations, the API, a
+worker and a demo receiver that fails twice per event before accepting:
 
 ```bash
-docker compose up
+docker compose up --build
 ```
 
-Then, with `HOOKLINE_ALLOW_PRIVATE_URLS=true` so a local receiver is allowed:
+The API key is `dev-key`, and the receiver is `http://receiver:9000/` from inside compose.
+Stop with Ctrl+C; `docker compose down -v` deletes the data.
+
+**Without Docker**, SQLite is enough for a look. Use three terminals, all from the repo root,
+each with these variables set first:
+
+```bash
+export HOOKLINE_DATABASE_URL=sqlite+aiosqlite:////tmp/hookline.db \
+  HOOKLINE_API_KEY=dev-key HOOKLINE_ALLOW_PRIVATE_URLS=true HOOKLINE_BACKOFF_BASE_SECONDS=5
+```
+
+1. Terminal 1: `uv sync`, then `uv run hookline init-db`, then `uv run hookline serve`
+   (API and dashboard on http://127.0.0.1:8000).
+2. Terminal 2: `uv run hookline worker`.
+3. Terminal 3: `uv run hookline receiver --fail 2` (listens on port 9000).
+
+Stop each with Ctrl+C and delete `/tmp/hookline.db` to start over. For Postgres instead, copy
+`.env.example` to `.env`, set the URL and key there, and run `uv run alembic upgrade head`
+in place of `init-db`.
+
+**Send an event** from any terminal. With Docker, use `http://receiver:9000/` as the URL:
 
 ```bash
 curl -X POST localhost:8000/v1/endpoints -H 'Authorization: Bearer dev-key' \
   -H 'content-type: application/json' \
   -d '{"url": "http://127.0.0.1:9000/", "event_types": ["invoice.paid"]}'
-# -> {"id": "...", "secret": "whsec_...", ...}   the secret is shown only here
-
-uv run hookline receiver --fail 2 --secret whsec_...
+# the response holds the endpoint secret, shown only this once
 
 curl -X POST localhost:8000/v1/events -H 'Authorization: Bearer dev-key' \
   -H 'Idempotency-Key: inv_1042-paid' -H 'content-type: application/json' \
   -d '{"type": "invoice.paid", "data": {"invoice": "inv_1042", "amount": 12900}}'
 ```
 
-The receiver prints two refusals and an acceptance; the dashboard shows the three attempts and
-the gaps between them. Sending the same event again with the same `Idempotency-Key` returns the
-first one instead of creating a second.
+The worker logs two 503s and a 200. Open http://localhost:8000/dashboard and sign in with any
+user name and `dev-key` as the password to see the three attempts and the gaps between them.
+Sending the event again with the same `Idempotency-Key` returns the first one.
 
-| Command | |
+| Command (repo root) | |
 | --- | --- |
-| `uv run pytest` | the test suite; set `HOOKLINE_TEST_DATABASE_URL` to include the Postgres tests |
+| `uv run pytest` | 102 tests, plus 4 more with `HOOKLINE_TEST_DATABASE_URL` set to a Postgres |
 | `uv run ruff check && uv run mypy` | lint and strict type checking |
-| `uv run hookline receiver --fail N` | a demo endpoint that fails N times per event |
 | `./infra/build.sh` | the Lambda package, `dist/lambda.zip` |
 
 ## How delivery works
@@ -85,38 +95,19 @@ POST /v1/events ──> event + one delivery per subscribed endpoint
                         (or Retry-After)           (replayable)
 ```
 
-- **The deliveries table is the queue.** A worker claims due rows with
-  `SELECT ... FOR UPDATE SKIP LOCKED` and takes a lease on them. Any number of workers can poll
-  without two of them getting the same row. If a worker dies mid-request its lease runs out and
-  someone else picks the delivery up, so delivery is at-least-once, never stuck. Receivers
-  dedupe on `Hookline-Event-Id`.
-- **Every attempt has a deadline.** httpx's timeout is per read, so a receiver that sends a
-  byte every few seconds would never trip it. The whole attempt is bounded by
-  `attempt_deadline_seconds` (20 s), and the settings refuse a deadline longer than half the
-  lease or half the Lambda timeout. A worker claims more work as soon as a slot frees up, so a
-  slow endpoint holds one slot, never the whole worker.
-- **Backoff is exponential with jitter**: 30 s, 1 min, 2 min... capped at six hours, with half
-  of each delay random so a batch that failed together does not come back together. A
-  `Retry-After` header wins when there is one. Eight attempts by default, then the delivery is
-  dead-lettered with its last error, and a replay starts a fresh run.
-- **A circuit breaker per endpoint.** After five consecutive failures, across all its
-  deliveries, the endpoint rests for a minute. Failures still in flight when it trips land on an
-  open circuit and do not trip it again, so one outage is one trip. Deliveries that come due
-  meanwhile are postponed without spending an attempt, spread over the minute after it
-  reopens instead of arriving together. If the first of them fails the rest doubles, if it
-  succeeds everything resets.
-- **The database's clock decides.** Due times, leases and circuits all compare against
-  `now()` in Postgres, not the worker's clock, so workers on skewed hosts still agree.
-- **No redirects, no private addresses.** Endpoint URLs that resolve to loopback, private,
-  link-local (the cloud metadata service) or other non-public space are refused, when the
-  endpoint is registered and again before every attempt, including IPv6 forms that wrap an
-  IPv4 address (mapped, compatible, NAT64, 6to4, Teredo). The connection then goes to the
-  address that passed the check, not to a second DNS answer, so rebinding a name between the
-  check and the connect does not work; Host and TLS still use the registered name. Redirects
-  are not followed, since a public URL could redirect somewhere private.
-- **Untrusted headers stay untrusted.** A receiver's `Retry-After` is only read as ASCII digits
-  or a real HTTP date, and `verify()` raises `SignatureError` and nothing else for any header,
-  however it was crafted.
+- **The deliveries table is the queue.** Workers claim due rows with `SKIP LOCKED` and a lease,
+  so no two get the same row and a dead worker's lease runs out. Delivery is at-least-once;
+  receivers dedupe on `Hookline-Event-Id`.
+- **Every attempt has a deadline.** httpx's timeout is per read, so a receiver that drips a byte
+  every few seconds would never trip it; the whole attempt is bounded at 20 s instead.
+- **Backoff is exponential with jitter:** 30 s, 1 min, 2 min, capped at six hours, and a
+  `Retry-After` header wins. After eight attempts the delivery is dead-lettered.
+- **A circuit breaker per endpoint:** five consecutive failures rest it for a minute, and
+  deliveries due meanwhile are postponed without spending an attempt.
+- **The database's clock decides** due times, leases and circuits, so skewed workers agree.
+- **No redirects, no private addresses.** URLs that resolve to loopback, private or link-local
+  space are refused, including IPv6 wrappers of IPv4, and the connection goes to the address
+  that passed the check, so DNS rebinding does not work.
 
 ## Signatures
 
@@ -151,101 +142,52 @@ compute the HMAC, and compare in constant time.
 
 ## Deploying to AWS
 
-`infra/` has the Terraform (checked with `tofu validate`, not applied from this repository):
-
-- **API Gateway (HTTP API) → Lambda** running the FastAPI app through Mangum.
-- **SQS → Lambda** for the worker. With `HOOKLINE_QUEUE=sqs` the same queue interface sends
-  delivery ids to SQS instead of polling Postgres. Messages only say "look at delivery X"; the
-  database still decides whether it is due, so a duplicate or early message is harmless.
-  Delays over SQS's 15-minute limit are sent in hops. The worker reports per-message failures,
-  and a poison-message queue catches anything that cannot be processed at all. A message is
-  only deleted after the outcome is committed.
-- **A reconciler on a one-minute EventBridge schedule.** A delivery row can outlive its
-  message: the send failed after the commit, or the message went to the poison queue. The
-  reconciler finds pending rows that are overdue and unleased and queues them again; a
-  duplicate is harmless because the worker only acts on a row it can lease. With the Postgres
-  queue there is nothing to reconcile, and the CLI worker runs it on its own interval with SQS.
-- **RDS Postgres** in private subnets, reachable only from the functions.
-- **A connection budget.** Each Lambda container has its own pool, so the worker cap, the
-  API's reserved concurrency and a pool of two per container add up to a fixed ceiling, and
-  `tofu plan` fails if that ceiling is over the database's `max_connections`. For more
-  headroom, set `HOOKLINE_DB_NULL_POOL=true` behind RDS Proxy.
+`infra/` has the Terraform, checked with `tofu validate` but not applied from this repository:
+API Gateway to a Lambda running the app through Mangum, SQS to a worker Lambda
+(`HOOKLINE_QUEUE=sqs`), a one-minute reconciler for rows that outlived their message, RDS
+Postgres in private subnets, and a connection budget that fails `tofu plan` if the Lambdas
+could exceed `max_connections`.
 
 ```bash
 ./infra/build.sh
 cd infra && tofu init && tofu apply \
   -var vpc_id=vpc-... -var 'private_subnet_ids=["subnet-a","subnet-b"]' \
   -var api_key=... -var db_password=...
-alembic upgrade head   # against the new database, from a host that can reach it
 ```
 
-The subnets need a NAT gateway: the worker has to reach the internet to deliver anything.
+Then run `alembic upgrade head` against the new database from a host that can reach it. The
+subnets need a NAT gateway, since the worker has to reach the internet.
 
 ## Things worth opening
 
-**`src/hookline/delivery.py`.** One attempt, start to finish, and every decision taken from its
-outcome: delivered, retry when, or give up. The session is closed while the request is in
-flight; the lease is checked again before anything is written, so a worker that was merely
-slow records what happened without overruling the worker that took over.
-
-**`src/hookline/queues.py`.** The two queues behind one three-method interface. The Postgres
-claim is a single `UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED) RETURNING id`.
-
-**`src/hookline/signing.py`.** Forty lines, and the part other people's code depends on, so it
-has a test that pins the exact bytes being signed.
-
-**`src/hookline/urls.py`.** Why a webhook service is an SSRF tool unless it is careful, and
-what "careful" covers, down to pinning the checked address into httpcore's network backend.
-
-**`src/hookline/service.py`.** Idempotency keys: two concurrent requests with the same key race
-on a unique index, and the loser reads the winner's event. A reused key with a different body
-is a 409, not a silent no-op.
+- **`src/hookline/delivery.py`:** one attempt and every decision taken from its outcome; the
+  lease is checked again before writing, so a slow worker never overrules the one that took over.
+- **`src/hookline/queues.py`:** the Postgres and SQS queues behind one three-method interface.
+- **`src/hookline/signing.py`:** forty lines, with a test that pins the exact bytes signed.
+- **`src/hookline/urls.py`:** what it takes for a webhook service not to be an SSRF tool.
+- **`src/hookline/service.py`:** idempotency keys racing on a unique index; a reused key with a
+  different body is a 409.
 
 ## Tests
 
-```bash
-uv run pytest
-HOOKLINE_TEST_DATABASE_URL=postgresql+asyncpg://localhost/hookline_test uv run pytest
-```
-
-106 tests, 102 without a database. On SQLite: signatures (including a pinned vector, rotation
-and crafted headers), the backoff schedule and hostile `Retry-After` values, the URL checks
-and every IPv6 wrapper of a private address, every API route, body limits that hold even when
-`Content-Length` lies, the dashboard, and the delivery engine against a scripted fake
-receiver: retry and deliver, dead-letter, redirects, blocked addresses, the circuit opening,
-postponing and resetting, a worker losing its lease mid-request, an attempt cut off at its
-deadline by a server that drips bytes, a connection that goes to the checked address when DNS
-answers something else the second time, a worker that keeps claiming while one delivery
-hangs, and a claim that is not acknowledged when recording fails. The SQS queue, the Lambda
-handlers and the reconciler (a failed send after commit, then an idempotent retry, ends
-delivered) run against moto. With Postgres, four more: eight workers claiming at once never
-get the same row, ten concurrent publishes with one key make one event, concurrent failures
-are all counted, and ten failing at once trip the circuit once.
+The 102 tests that run on SQLite cover signatures, backoff and hostile `Retry-After` values,
+every IPv6 wrapper of a private address, every API route, the dashboard, and the delivery
+engine against a scripted fake receiver, including lost leases, dripping servers and DNS that
+changes its answer. SQS, the Lambda handlers and the reconciler run against moto. The 4
+Postgres tests prove eight workers never claim the same row and one key makes one event.
 
 ## Layout
 
 ```
-src/hookline/
-  signing.py     sign() and verify()
-  retry.py       backoff and Retry-After
-  urls.py        which addresses may be delivered to
-  models.py      endpoints, events, deliveries, attempts
-  queues.py      Postgres SKIP LOCKED queue and SQS queue
-  delivery.py    one attempt and its consequences
-  service.py     publish with idempotency, replay
-  worker.py      the claim-and-deliver loop
-  api.py         the HTTP API
-  dashboard.py   server-rendered dashboard (Jinja + htmx)
-  aws.py         Lambda handlers for API Gateway and SQS
-  receiver.py    the demo receiver
-migrations/      Alembic
-infra/           Terraform for API Gateway, Lambda, SQS, RDS
+src/hookline/   signing, retry, urls, models, queues, delivery, service, worker,
+                api, dashboard (Jinja + htmx), aws (Lambda handlers), receiver
+migrations/     Alembic
+infra/          Terraform for API Gateway, Lambda, SQS, RDS
 ```
 
 ## What's missing
 
-- One API key for everything. A real multi-tenant service needs per-tenant keys and endpoints
-  scoped to them.
-- Secrets are stored as given. They should be encrypted at rest, and the Terraform passes the
-  database password through a variable where Secrets Manager would be better.
+- One API key for everything; a multi-tenant service needs keys and endpoints per tenant.
+- Secrets are stored as given, and the database password goes through a Terraform variable
+  where Secrets Manager would be better.
 - No rate limit per endpoint beyond the circuit breaker.
