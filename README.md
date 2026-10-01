@@ -76,7 +76,7 @@ Sending the event again with the same `Idempotency-Key` returns the first one.
 
 | Command (repo root) | |
 | --- | --- |
-| `uv run pytest` | 102 tests, plus 4 more with `HOOKLINE_TEST_DATABASE_URL` set to a Postgres |
+| `uv run pytest` | 106 tests, plus 4 more with `HOOKLINE_TEST_DATABASE_URL` set to a Postgres |
 | `uv run ruff check && uv run mypy` | lint and strict type checking |
 | `./infra/build.sh` | the Lambda package, `dist/lambda.zip` |
 
@@ -170,7 +170,7 @@ subnets need a NAT gateway, since the worker has to reach the internet.
 
 ## Tests
 
-The 102 tests that run on SQLite cover signatures, backoff and hostile `Retry-After` values,
+The 106 tests that run on SQLite cover signatures, backoff and hostile `Retry-After` values,
 every IPv6 wrapper of a private address, every API route, the dashboard, and the delivery
 engine against a scripted fake receiver, including lost leases, dripping servers and DNS that
 changes its answer. SQS, the Lambda handlers and the reconciler run against moto. The 4
